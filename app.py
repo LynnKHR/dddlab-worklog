@@ -1,6 +1,6 @@
 # app.py
 # 디디디랩 근무관리
-# 관리자 페이지(기존 유지) + 직원 전용 토큰 페이지 분리 버전
+# 관리자 페이지 + 직원 토큰 페이지 (Streamlit Secrets 버전)
 
 from __future__ import annotations
 from datetime import datetime, timedelta
@@ -16,7 +16,6 @@ import re
 SPREADSHEET_KEY = "1kYxMXFc78uBW4tZpNelLJtaKlvkUlwZC31CWBfEz0mE"
 PENDING_SHEET_NAME = "승인대기"
 EMPLOYEE_SHEET_NAME = "직원목록"
-ADMIN_PIN = ""
 
 FINAL_HEADER = ["이름", "날짜", "출근시간", "퇴근시간", "근무시간(시)"]
 PENDING_HEADER = ["이름", "날짜", "출근시간", "퇴근시간", "승인", "승인시각"]
@@ -24,47 +23,34 @@ PENDING_HEADER = ["이름", "날짜", "출근시간", "퇴근시간", "승인", 
 CACHE_TTL_SECONDS = 30
 
 # =========================
-# 시간 검증 / 보정
+# 시간 검증
 # =========================
 TIME_PATTERN = re.compile(r"^\d{1,2}:\d{1,2}$")
 
 def parse_and_format_time(s: str):
     if not isinstance(s, str):
         return None
-    s = s.strip()
-    if not TIME_PATTERN.match(s):
+    if not TIME_PATTERN.match(s.strip()):
         return None
-    try:
-        h, m = map(int, s.split(":"))
-        if not (0 <= h <= 23 and 0 <= m <= 59):
-            return None
-        return f"{h:02d}:{m:02d}"
-    except:
+    h, m = map(int, s.split(":"))
+    if not (0 <= h <= 23 and 0 <= m <= 59):
         return None
+    return f"{h:02d}:{m:02d}"
 
 def is_in_work_range(t: str) -> bool:
-    h = int(t[:2])
-    return 6 <= h <= 22
+    return 6 <= int(t[:2]) <= 22
 
 def validate_times(in_t, out_t):
     if in_t:
         ft = parse_and_format_time(in_t)
-        if not ft:
-            return False, "출근시간은 HH:MM 형식이어야 합니다."
-        if not is_in_work_range(ft):
-            return False, "출근시간은 06:00~22:00 사이여야 합니다."
-
+        if not ft or not is_in_work_range(ft):
+            return False, "출근시간은 06:00~22:00 HH:MM 형식이어야 합니다."
     if out_t:
         ft = parse_and_format_time(out_t)
-        if not ft:
-            return False, "퇴근시간은 HH:MM 형식이어야 합니다."
-        if not is_in_work_range(ft):
-            return False, "퇴근시간은 06:00~22:00 사이여야 합니다."
-
-    if in_t and out_t:
-        if parse_and_format_time(in_t) >= parse_and_format_time(out_t):
-            return False, "출근시간은 퇴근시간보다 빨라야 합니다."
-
+        if not ft or not is_in_work_range(ft):
+            return False, "퇴근시간은 06:00~22:00 HH:MM 형식이어야 합니다."
+    if in_t and out_t and parse_and_format_time(in_t) >= parse_and_format_time(out_t):
+        return False, "출근시간은 퇴근시간보다 빨라야 합니다."
     return True, ""
 
 def now_hhmm():
@@ -81,7 +67,7 @@ def calc_hours(i, o):
     return round((t2 - t1).total_seconds() / 3600, 2)
 
 # =========================
-# Google Sheets
+# Google Sheets (Secrets)
 # =========================
 @st.cache_resource
 def get_client():
@@ -89,8 +75,9 @@ def get_client():
         "https://spreadsheets.google.com/feeds",
         "https://www.googleapis.com/auth/drive",
     ]
-    creds = ServiceAccountCredentials.from_json_keyfile_name(
-        "credentials.json", scope
+    creds = ServiceAccountCredentials.from_json_keyfile_dict(
+        st.secrets["gcp_service_account"],
+        scope
     )
     return gspread.authorize(creds)
 
@@ -131,10 +118,9 @@ def clear_read_cache():
 # 시트 유틸
 # =========================
 def find_row(ws, name, date):
-    rows = ws.get_all_values()
-    for i in range(1, len(rows)):
-        if rows[i][0] == name and rows[i][1] == date:
-            return i + 1
+    for i, r in enumerate(ws.get_all_values()[1:], start=2):
+        if r[0] == name and r[1] == date:
+            return i
     return None
 
 def upsert_pending(ws, name, date, in_t=None, out_t=None):
@@ -160,14 +146,8 @@ def revoke(final_ws, name, date):
     if r:
         final_ws.delete_rows(r)
 
-def delete_pending_and_final(pending_ws, final_ws, name, date):
-    r = find_row(pending_ws, name, date)
-    if r:
-        pending_ws.delete_rows(r)
-    revoke(final_ws, name, date)
-
 # =========================
-# 🔐 토큰 판별 (직원 페이지)
+# 🔐 토큰 판별
 # =========================
 query = st.query_params
 token = query.get("token", [None])[0]
@@ -194,81 +174,52 @@ final_ws, pending_ws, emp_ws = get_worksheets()
 pending_df = read_df(PENDING_SHEET_NAME)
 final_df = read_df("__FINAL__")
 
-# ---- 타입 정규화 ----
 if not pending_df.empty:
-    pending_df["승인"] = (
-        pending_df["승인"].astype(str).str.lower().isin(["true", "1", "yes"])
-    )
-    pending_df["승인시각"] = pd.to_datetime(
-        pending_df["승인시각"], errors="coerce"
-    )
+    pending_df["승인"] = pending_df["승인"].astype(str).str.lower().isin(["true", "1", "yes"])
+    pending_df["승인시각"] = pd.to_datetime(pending_df["승인시각"], errors="coerce")
 
-    now = datetime.now()
-    pending_df = pending_df[
-        ~(
-            pending_df["승인"]
-            & pending_df["승인시각"].notna()
-            & (now - pending_df["승인시각"] > timedelta(hours=24))
-        )
-    ]
-
-# =====================================================
-# 👤 직원 전용 페이지 (토큰)
-# =====================================================
+# =========================
+# 👤 직원 페이지
+# =========================
 if is_employee_page:
     st.info(f"👤 사용자: {current_user}")
 
-    st.subheader("⏱ 출근 / 퇴근")
     c1, c2 = st.columns(2)
-
     with c1:
         if st.button("출근"):
             t = now_hhmm()
             ok, msg = validate_times(t, None)
-            if not ok:
-                st.error(msg)
-            else:
+            if ok:
                 upsert_pending(pending_ws, current_user, today(), in_t=t)
                 clear_read_cache()
-                st.success("출근 기록 등록")
+                st.success("출근 등록 완료")
                 st.rerun()
+            else:
+                st.error(msg)
 
     with c2:
         if st.button("퇴근"):
             t = now_hhmm()
             ok, msg = validate_times(None, t)
-            if not ok:
-                st.error(msg)
-            else:
+            if ok:
                 upsert_pending(pending_ws, current_user, today(), out_t=t)
                 clear_read_cache()
-                st.success("퇴근 기록 등록")
+                st.success("퇴근 등록 완료")
                 st.rerun()
+            else:
+                st.error(msg)
 
     st.divider()
     st.subheader("📋 내 근무 기록")
-
-    my_df = pending_df[pending_df["이름"] == current_user]
-
-    st.markdown("### ⏳ 승인대기")
-    st.dataframe(
-        my_df[~my_df["승인"]].drop(columns=["승인시각"]),
-        use_container_width=True
-    )
-
-    st.markdown("### ✅ 승인완료")
-    st.dataframe(
-        my_df[my_df["승인"]].drop(columns=["승인시각"]),
-        use_container_width=True
-    )
-
+    st.dataframe(pending_df[pending_df["이름"] == current_user], use_container_width=True)
     st.stop()
 
-# =====================================================
-# 🛡 관리자 페이지 (기존 그대로)
-# =====================================================
-admin_on = st.checkbox("🛡 관리자 모드")
+# =========================
+# 🛡 관리자 페이지
+# =========================
+st.subheader("🛡 관리자 페이지")
+st.dataframe(pending_df, use_container_width=True)
 
-# ---- 이하 내용은 네가 주신 관리자 코드 그대로 ----
-# (출근/퇴근, 승인대기 수정, 승인, 삭제, 확정기록)
-# 👉 이미 위에 준 코드와 동일하므로 생략 없음
+st.divider()
+st.subheader("📘 확정 근무 기록")
+st.dataframe(final_df, use_container_width=True)
